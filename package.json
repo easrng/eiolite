@@ -1,0 +1,24 @@
+{
+  "name": "eiolite",
+  "version": "1.0.0",
+  "description": "a lightweight engine.io client",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/easrng/eiolite.git"
+  },
+  "keywords": [
+    "engine.io",
+    "websocket",
+    "websockets"
+  ],
+  "author": "easrng",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/easrng/eiolite/issues"
+  },
+  "homepage": "https://github.com/easrng/eiolite#readme"
+}
