@@ -1,3 +1,8 @@
+const readyState_CONNECTING = 0;
+const readyState_OPEN = 1;
+const readyState_CLOSING = 2;
+const readyState_CLOSED = 3;
+
 const eio_open = "0"; // Used during the handshake.
 const eio_close = "1"; // Used to indicate that a transport can be closed.
 const eio_ping = "2"; // Used in the heartbeat mechanism.
@@ -5,42 +10,32 @@ const eio_pong = "3"; // Used in the heartbeat mechanism.
 const eio_message = "4"; // Used to send a payload to the other side.
 const eio_upgrade = "5"; // Used during the upgrade process.
 const eio_noop = "6"; // Used during the upgrade process.
-const internalWebsocket = Symbol();
-const internalTimeout = Symbol();
-const internalTimeoutHandle = Symbol();
-export default class extends EventTarget {
-  constructor(url = "/engine.io/", sid) {
+const internals = new WeakMap();
+const internal = (obj) => {
+  const ret = internals.get(obj) || {};
+  internals.set(obj, ret);
+  return ret;
+};
+const event = (obj, e) => obj.dispatchEvent(new Event(e));
+const newMessage = (obj, d) =>
+  obj.dispatchEvent(new MessageEvent("message", { data: d }));
+class eiolite extends EventTarget {
+  constructor(url = "/engine.io/") {
     super();
-    const setROProp = (prop, value, hidden) =>
-      Object.defineProperty(this, prop, {
-        value,
-        configurable: true,
-        enumerable: !hidden,
-      });
     const u = new URL(url, location.href);
     u.hash = u.search = "";
     u.protocol = u.protocol.replace(/^http/, "ws");
-    setROProp("url", u.href);
-    const ws = new WebSocket(
-      u + "?EIO=4&transport=websocket" + (sid ? "&sid=" + sid : "")
-    );
-    setROProp(internalWebsocket, ws, true);
-    setROProp("readyState", 0);
+    internal(this).url = u.href;
+    const ws = new WebSocket(u + "?EIO=4&transport=websocket");
+    internal(this).webSocket = ws;
+    internal(this).readyState = readyState_CONNECTING;
     ws.binaryType = "arraybuffer";
-    const newMessage = (d) => {
-      const m = new MessageEvent("message", { data: d });
-      this.dispatchEvent(m);
-    };
+    let timeout;
+    let timeoutHandle;
     const heartbeat = () => {
-      if (this[internalTimeoutHandle])
-        clearTimeout(this[internalTimeoutHandle]);
-      setROProp(
-        internalTimeoutHandle,
-        setTimeout(() => ws.close(), this[internalTimeout]),
-        true
-      );
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      timeoutHandle = setTimeout(() => ws.close(), timeout);
     };
-    const event = (e) => this.dispatchEvent(new Event(e));
     ws.addEventListener("message", (e) => {
       if (typeof e.data === "string") {
         let info,
@@ -48,13 +43,9 @@ export default class extends EventTarget {
         switch (e.data[0]) {
           case eio_open:
             info = JSON.parse(sliced);
-            setROProp(
-              internalTimeout,
-              info.pingInterval + info.pingTimeout,
-              true
-            );
-            setROProp("sid", info.sid);
-            setROProp("readyState", 1), event("open");
+            timeout = info.pingInterval + info.pingTimeout;
+            internal(this).readyState = readyState_OPEN;
+            event(this, "open");
             heartbeat();
             break;
           case eio_ping:
@@ -62,27 +53,105 @@ export default class extends EventTarget {
             heartbeat();
             break;
           case eio_message:
-            newMessage(sliced);
+            newMessage(this, sliced);
             break;
         }
       } else {
-        newMessage(e.data);
+        newMessage(this, e.data);
       }
     });
-    ws.addEventListener(
-      "close",
-      () => (setROProp("readyState", 3), event("close"))
-    );
-    if (sid) ws.addEventListener("open", () => ws.send("2probe"));
+    ws.addEventListener("close", () => {
+      internal(this).readyState = readyState_CLOSED;
+      event(this, "close");
+    });
   }
   close() {
-    this[internalWebsocket].close();
+    internal(this).webSocket.close();
   }
   send(data) {
     if (typeof data === "string") {
-      this[internalWebsocket].send(eio_message + data);
+      internal(this).webSocket.send(eio_message + data);
     } else {
-      this[internalWebsocket].send(data);
+      internal(this).webSocket.send(data);
     }
+  }
+  get url() {
+    return internal(this).url;
+  }
+  get readyState() {
+    return internal(this).readyState;
+  }
+}
+export default eiolite;
+export class reconnecting extends EventTarget {
+  constructor(url = "/engine.io/") {
+    super();
+    let eio;
+    internal(this).url = url;
+    const queue = [];
+    const send = (packet) => {
+      if (internal(this).readyState === readyState_CONNECTING) {
+        queue.push(packet);
+      } else {
+        eio.send(packet);
+      }
+    };
+    internal(this).send = send;
+    internal(this).readyState = readyState_CONNECTING;
+    let retryDelay = 100;
+    const maxRetryDelay = 30000;
+    const retryFactor = 2;
+    const jitterFactor = 0.2;
+    const connect = () => {
+      eio = new eiolite(url);
+      internal(this).close = () => eio.close();
+      eio.addEventListener("message", (e) => {
+        newMessage(this, e.data);
+      });
+      eio.addEventListener("open", () => {
+        internal(this).readyState = readyState_OPEN;
+        let message;
+        while ((message = queue.pop())) {
+          send(message);
+        }
+        event(this, "open");
+      });
+      eio.addEventListener("close", () => {
+        if (internal(this).readyState < readyState_CLOSING) {
+          scheduleRetry();
+        } else {
+          internal(this).readyState = readyState_CLOSED;
+          event(this, "close");
+        }
+      });
+    };
+    const scheduleRetry = () => {
+      internal(this).readyState = readyState_CONNECTING;
+      retryDelay = Math.min(retryDelay * retryFactor, maxRetryDelay);
+      const retryTimeout = setTimeout(
+        connect,
+        retryDelay + (Math.random() * 2 - 1) * jitterFactor * retryDelay,
+      );
+      internal(this).close = () => {
+        clearTimeout(retryTimeout);
+        internal(this).readyState = readyState_CLOSED;
+        event(this, "close");
+      };
+      event(this, "reconnecting");
+    };
+    connect();
+  }
+  close() {
+    internal(this).readyState = readyState_CLOSING;
+    internal(this).close();
+  }
+  get url() {
+    return internal(this).url;
+  }
+  get send() {
+    return internal(this).send;
+  }
+  get readyState() {
+    return internal(this).readyState;
   }
 }
